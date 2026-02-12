@@ -1,0 +1,6 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+osascript -e "tell application \"Terminal\"
+    activate
+    do script \"cd '$DIR' && python3 enrich_knowledge_base.py --serve\"
+end tell"

@@ -10,12 +10,17 @@ Enrich Joel Stremmel's knowledge base with paper metadata.
 - Final step: regenerates the HTML page
 """
 
+import argparse
+import http.server
 import json
 import re
+import socketserver
 import ssl
 import time
+import threading
 import urllib.request
 import urllib.parse
+import webbrowser
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -313,7 +318,7 @@ def generate_html(data: dict) -> str:
     --blog: #d2a8ff;
     --video: #ff7b72;
     --tool: #79c0ff;
-    --podcast: #ffa657;
+    --pod: #ffa657;
     --doc: #56d4dd;
     --news: #f778ba;
     --other: #8b949e;
@@ -347,10 +352,23 @@ def generate_html(data: dict) -> str:
   .header h1 {{
     font-size: 18px;
     font-weight: 600;
-    margin-bottom: 12px;
+    margin-bottom: 4px;
     color: var(--text);
   }}
   .header h1 span {{ color: var(--text2); font-weight: 400; }}
+
+  .instructions {{
+    font-size: 12px;
+    color: var(--text2);
+    margin-bottom: 12px;
+    line-height: 1.4;
+  }}
+  .instructions code {{
+    background: var(--surface2);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 11px;
+  }}
 
   .controls {{
     display: flex;
@@ -503,6 +521,48 @@ def generate_html(data: dict) -> str:
     margin-top: 4px;
   }}
 
+  /* --- Remove button --- */
+  .remove-btn {{
+    opacity: 0;
+    font-size: 11px;
+    color: var(--text2);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }}
+  .item-row:hover .remove-btn {{ opacity: 1; }}
+  .remove-btn:hover {{
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+    background: rgba(255,107,107,0.1);
+  }}
+
+  .item-row.removed {{
+    opacity: 0.4;
+    text-decoration: line-through;
+  }}
+  .item-row.removed .remove-btn {{
+    opacity: 1;
+    color: var(--accent);
+    border-color: var(--accent);
+  }}
+
+  .removed-badge {{
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(255,107,107,0.15);
+    color: #ff6b6b;
+    flex-shrink: 0;
+  }}
+
   /* --- Main content --- */
   .container {{
     max-width: 960px;
@@ -601,8 +661,8 @@ def generate_html(data: dict) -> str:
   .type-blog {{ background: rgba(210,168,255,0.15); color: var(--blog); }}
   .type-video {{ background: rgba(255,123,114,0.15); color: var(--video); }}
   .type-tool {{ background: rgba(121,192,255,0.15); color: var(--tool); }}
-  .type-podcast {{ background: rgba(255,166,87,0.15); color: var(--podcast); }}
-  .type-documentation {{ background: rgba(86,212,221,0.15); color: var(--doc); width: 62px; }}
+  .type-pod {{ background: rgba(255,166,87,0.15); color: var(--pod); }}
+  .type-docs {{ background: rgba(86,212,221,0.15); color: var(--doc); }}
   .type-news {{ background: rgba(247,120,186,0.15); color: var(--news); }}
   .type-other {{ background: rgba(139,148,158,0.15); color: var(--other); }}
 
@@ -709,15 +769,17 @@ def generate_html(data: dict) -> str:
 <div class="header">
   <div class="header-inner">
     <h1>Joel Stremmel <span>— Knowledge Base</span></h1>
+    <p class="instructions">Click "+ Add" to bookmark new links, or hover any item and click "Remove" to delete it. Run <code>python enrich_knowledge_base.py --serve</code> for live editing, or use "Export JSON" to save manually.</p>
     <div class="controls">
       <input type="text" id="search" placeholder="Search titles, summaries, authors, URLs..." autofocus>
       <div class="filter-bar" id="filters"></div>
-      <button class="bookmark-toggle" id="bookmark-toggle">+ Add Bookmark</button>
+      <button class="bookmark-toggle" id="bookmark-toggle">+ Add</button>
+      <button class="btn" id="bm-export">Export JSON</button>
+      <button class="btn" id="bm-clear-removals">Clear Removals</button>
+      <button class="btn btn-primary" id="bm-save-enrich" style="display:none">Save &amp; Enrich</button>
       <span class="stats" id="stats"></span>
-    </div>
-    <div class="legend" id="legend">
-      <span class="legend-item"><span class="legend-dot filled"></span> enriched paper metadata</span>
-      <span class="legend-item"><span class="legend-dot empty"></span> catalogued only</span>
+      <span id="bm-pending-count" style="font-size:12px;color:var(--text2)"></span>
+      <span id="server-status" style="font-size:11px;color:var(--text2)"></span>
     </div>
     <div class="keyboard-hint" style="margin-top:6px">
       <kbd>/</kbd> focus search &nbsp; <kbd>Esc</kbd> clear &nbsp; <kbd>E</kbd> expand all &nbsp; <kbd>C</kbd> collapse all
@@ -744,8 +806,8 @@ def generate_html(data: dict) -> str:
       <option value="blog">blog</option>
       <option value="video">video</option>
       <option value="tool">tool</option>
-      <option value="podcast">podcast</option>
-      <option value="documentation">documentation</option>
+      <option value="pod">pod</option>
+      <option value="docs">docs</option>
       <option value="news">news</option>
       <option value="other" selected>other</option>
     </select>
@@ -756,8 +818,6 @@ def generate_html(data: dict) -> str:
   </div>
   <div class="bookmark-actions">
     <button class="btn btn-primary" id="bm-add">Add Bookmark</button>
-    <button class="btn" id="bm-export">Export JSON</button>
-    <span id="bm-pending-count" style="font-size:12px;color:var(--text2)"></span>
   </div>
 </div>
 
@@ -768,7 +828,7 @@ def generate_html(data: dict) -> str:
 <script>
 const DATA = ''' + json_data + ''';
 
-const TYPES = ["paper","repo","blog","video","tool","podcast","documentation","news","other"];
+const TYPES = ["paper","repo","blog","video","tool","pod","docs","news","other"];
 const activeTypes = new Set();
 
 // --- Pending additions from localStorage ---
@@ -779,10 +839,34 @@ function getPending() {
 function savePending(arr) {
   localStorage.setItem("kb_pending_additions", JSON.stringify(arr));
 }
-function getMergedData() {
+
+// --- Pending removals from localStorage ---
+function getRemovals() {
+  try { return JSON.parse(localStorage.getItem("kb_pending_removals") || "[]"); }
+  catch { return []; }
+}
+function saveRemovals(arr) {
+  localStorage.setItem("kb_pending_removals", JSON.stringify(arr));
+}
+function toggleRemoval(url) {
+  const removals = getRemovals();
+  const idx = removals.indexOf(url);
+  if (idx >= 0) {
+    removals.splice(idx, 1);
+  } else {
+    removals.push(url);
+  }
+  saveRemovals(removals);
+  render();
+  applyFilters();
+}
+function getMergedData(includeRemovals = true) {
   const pending = getPending();
-  if (pending.length === 0) return DATA;
+  const removals = getRemovals();
+  const removedSet = new Set(removals);
   const merged = JSON.parse(JSON.stringify(DATA));
+
+  // Add pending items
   pending.forEach(p => {
     const cat = merged.categories.find(c => c.name === p._category);
     if (cat) {
@@ -791,6 +875,14 @@ function getMergedData() {
       cat.items.push(item);
     }
   });
+
+  // Remove items marked for removal (only when exporting)
+  if (!includeRemovals) {
+    merged.categories.forEach(cat => {
+      cat.items = cat.items.filter(item => !removedSet.has(item.url));
+    });
+  }
+
   merged.metadata.total_items = 0;
   merged.categories.forEach(c => merged.metadata.total_items += c.items.length);
   return merged;
@@ -827,9 +919,11 @@ function render() {
   container.innerHTML = "";
   container.appendChild(noResults);
 
-  const merged = getMergedData();
+  const merged = getMergedData(true);
   const pending = getPending();
   const pendingUrls = new Set(pending.map(p => p.url));
+  const removals = getRemovals();
+  const removedUrls = new Set(removals);
 
   // Populate category dropdown
   const catSelect = document.getElementById("bm-category");
@@ -874,6 +968,11 @@ function render() {
       const year = formatYear(item.date);
       const authorsStr = formatAuthors(item.authors);
       const isPending = pendingUrls.has(item.url);
+      const isRemoved = removedUrls.has(item.url);
+
+      if (isRemoved) {
+        row.classList.add("removed");
+      }
 
       // Main row
       const mainDiv = document.createElement("div");
@@ -886,9 +985,11 @@ function render() {
       let linkHtml = `<a class="item-link" href="${escapeHtml(item.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${escapeHtml(item.title)}</a>`;
       let authorsHtml = authorsStr ? `<span class="authors-inline">${escapeHtml(authorsStr)}</span>` : "";
       let pendingHtml = isPending ? `<span class="pending-badge">pending</span>` : "";
+      let removedHtml = isRemoved ? `<span class="removed-badge">removing</span>` : "";
       let domainHtml = `<span class="item-domain">${escapeHtml(domain)}</span>`;
+      let removeBtnHtml = `<button class="remove-btn" data-url="${encodeURIComponent(item.url)}">${isRemoved ? "Undo" : "Remove"}</button>`;
 
-      mainDiv.innerHTML = dotHtml + badgeHtml + linkHtml + yearHtml + authorsHtml + pendingHtml + domainHtml;
+      mainDiv.innerHTML = dotHtml + badgeHtml + linkHtml + yearHtml + authorsHtml + pendingHtml + removedHtml + domainHtml + removeBtnHtml;
 
       // Click row to expand detail (not the link)
       mainDiv.addEventListener("click", (e) => {
@@ -975,8 +1076,12 @@ function updateStats(visible) {
 
 function updatePendingCount() {
   const pending = getPending();
+  const removals = getRemovals();
   const el = document.getElementById("bm-pending-count");
-  el.textContent = pending.length > 0 ? pending.length + " pending" : "";
+  const parts = [];
+  if (pending.length > 0) parts.push(pending.length + " to add");
+  if (removals.length > 0) parts.push(removals.length + " to remove");
+  el.textContent = parts.join(", ");
 }
 
 function renderFilters() {
@@ -1039,9 +1144,43 @@ document.getElementById("bm-add").addEventListener("click", () => {
   applyFilters();
 });
 
-document.getElementById("bm-export").addEventListener("click", () => {
-  const merged = getMergedData();
-  const blob = new Blob([JSON.stringify(merged, null, 2)], {type: "application/json"});
+// --- Export: save directly to repo file via File System Access API ---
+let savedFileHandle = null;
+
+document.getElementById("bm-export").addEventListener("click", async () => {
+  const merged = getMergedData(false); // Exclude removed items
+  const jsonStr = JSON.stringify(merged, null, 2);
+
+  const pendingCount = getPending().length;
+  const removalCount = getRemovals().length;
+
+  // Try File System Access API (Chrome/Edge) to write in-place
+  if (window.showSaveFilePicker) {
+    try {
+      if (!savedFileHandle) {
+        savedFileHandle = await window.showSaveFilePicker({
+          suggestedName: "joel_stremmel_knowledge_base.json",
+          types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
+        });
+      }
+      const writable = await savedFileHandle.createWritable();
+      await writable.write(jsonStr);
+      await writable.close();
+      // Clear pending additions and removals since they're now applied
+      savePending([]);
+      saveRemovals([]);
+      render();
+      applyFilters();
+      alert(`Saved! ${pendingCount} additions, ${removalCount} removals applied. Run enrich script to update HTML.`);
+      return;
+    } catch (e) {
+      if (e.name === "AbortError") return; // user cancelled picker
+      // Fall through to download
+    }
+  }
+
+  // Fallback: regular download
+  const blob = new Blob([jsonStr], {type: "application/json"});
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "joel_stremmel_knowledge_base.json";
@@ -1049,23 +1188,76 @@ document.getElementById("bm-export").addEventListener("click", () => {
   URL.revokeObjectURL(a.href);
 });
 
+// --- Clear pending removals ---
+document.getElementById("bm-clear-removals").addEventListener("click", () => {
+  const removals = getRemovals();
+  if (removals.length === 0) {
+    alert("No pending removals to clear.");
+    return;
+  }
+  if (confirm(`Clear ${removals.length} pending removal(s)?`)) {
+    saveRemovals([]);
+    render();
+    applyFilters();
+  }
+});
+
 // --- Auto-populate title from URL ---
+async function fetchArxivTitle(arxivId) {
+  try {
+    const resp = await fetch(`https://export.arxiv.org/api/query?id_list=${arxivId}&max_results=1`);
+    const text = await resp.text();
+    const match = text.match(/<title>([^<]+)<\\/title>/g);
+    if (match && match.length > 1) {
+      // First title is "ArXiv Query", second is the paper title
+      let title = match[1].replace(/<\\/?title>/g, "").trim();
+      // Clean up arxiv ID prefix if present
+      title = title.replace(/^\\[\\d+\\.\\d+\\]\\s*/, "");
+      return title;
+    }
+  } catch (e) {
+    console.log("Failed to fetch arxiv title:", e);
+  }
+  return null;
+}
+
+function extractArxivId(url) {
+  const m = url.match(/arxiv\\.org\\/(?:abs|pdf|html)\\/(\\d+\\.\\d+)/);
+  return m ? m[1] : null;
+}
+
 document.getElementById("bm-url").addEventListener("blur", async () => {
   const url = document.getElementById("bm-url").value.trim();
   const titleField = document.getElementById("bm-title");
-  if (url && !titleField.value.trim()) {
-    // Try to guess title from URL path
-    try {
-      const u = new URL(url);
-      const pathParts = u.pathname.split("/").filter(Boolean);
-      if (pathParts.length > 0) {
-        const last = decodeURIComponent(pathParts[pathParts.length - 1])
-          .replace(/[-_]/g, " ")
-          .replace(/\\.[^.]+$/, "");
-        titleField.value = last;
-      }
-    } catch {}
+  const typeField = document.getElementById("bm-type");
+
+  if (!url || titleField.value.trim()) return;
+
+  // Check for arxiv URL
+  const arxivId = extractArxivId(url);
+  if (arxivId) {
+    titleField.value = "Loading...";
+    typeField.value = "paper";
+    const title = await fetchArxivTitle(arxivId);
+    if (title) {
+      titleField.value = title;
+    } else {
+      titleField.value = "";
+    }
+    return;
   }
+
+  // Fallback: guess title from URL path
+  try {
+    const u = new URL(url);
+    const pathParts = u.pathname.split("/").filter(Boolean);
+    if (pathParts.length > 0) {
+      const last = decodeURIComponent(pathParts[pathParts.length - 1])
+        .replace(/[-_]/g, " ")
+        .replace(/\\.[^.]+$/, "");
+      titleField.value = last;
+    }
+  } catch {}
 });
 
 // --- Keyboard shortcuts ---
@@ -1092,8 +1284,94 @@ document.addEventListener("keydown", e => {
   }
 });
 
+// --- Event delegation for remove buttons ---
+document.getElementById("container").addEventListener("click", (e) => {
+  if (e.target.classList.contains("remove-btn")) {
+    e.stopPropagation();
+    const url = decodeURIComponent(e.target.dataset.url);
+    toggleRemoval(url);
+  }
+});
+
 render();
 renderFilters();
+
+// --- Server integration (when running with --serve) ---
+const SERVER_BASE = "http://localhost:8765";
+let serverAvailable = false;
+
+async function checkServer() {
+  try {
+    const resp = await fetch(SERVER_BASE + "/joel_stremmel_knowledge_base.json", { method: "HEAD" });
+    serverAvailable = resp.ok;
+  } catch {
+    serverAvailable = false;
+  }
+  updateServerUI();
+}
+
+function updateServerUI() {
+  const saveEnrichBtn = document.getElementById("bm-save-enrich");
+  const exportBtn = document.getElementById("bm-export");
+  const statusEl = document.getElementById("server-status");
+
+  if (serverAvailable) {
+    saveEnrichBtn.style.display = "inline-block";
+    exportBtn.style.display = "none";
+    statusEl.textContent = "server connected";
+    statusEl.style.color = "var(--repo)";
+  } else {
+    saveEnrichBtn.style.display = "none";
+    exportBtn.style.display = "inline-block";
+    statusEl.textContent = "";
+  }
+}
+
+document.getElementById("bm-save-enrich").addEventListener("click", async () => {
+  const btn = document.getElementById("bm-save-enrich");
+  const originalText = btn.textContent;
+
+  try {
+    btn.textContent = "Saving...";
+    btn.disabled = true;
+
+    // Get merged data (excluding removed items)
+    const merged = getMergedData(false);
+
+    // Save to server
+    const saveResp = await fetch(SERVER_BASE + "/api/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(merged),
+    });
+    const saveResult = await saveResp.json();
+    if (!saveResult.success) throw new Error(saveResult.error || "Save failed");
+
+    btn.textContent = "Enriching...";
+
+    // Run enrichment
+    const enrichResp = await fetch(SERVER_BASE + "/api/enrich", { method: "POST" });
+    const enrichResult = await enrichResp.json();
+    if (!enrichResult.success) throw new Error(enrichResult.error || "Enrich failed");
+
+    // Clear pending lists
+    savePending([]);
+    saveRemovals([]);
+
+    // Show success and reload
+    const msg = `Saved! ${enrichResult.papers_processed} papers processed, ${enrichResult.items_with_summary} items enriched. Reloading...`;
+    btn.textContent = "Done!";
+    setTimeout(() => location.reload(), 500);
+
+  } catch (err) {
+    alert("Error: " + err.message);
+    btn.textContent = originalText;
+    btn.disabled = false;
+  }
+});
+
+// Check server on load
+checkServer();
 </script>
 </body>
 </html>'''
@@ -1103,8 +1381,11 @@ renderFilters();
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    print("Loading knowledge base...")
+def run_enrichment(verbose=True):
+    """Run the enrichment pipeline. Returns a summary dict."""
+    log = print if verbose else lambda *a, **k: None
+
+    log("Loading knowledge base...")
     with open(JSON_PATH) as f:
         data = json.load(f)
 
@@ -1136,38 +1417,40 @@ def main():
                 non_paper_items.append(item)
 
     # Enrich arxiv papers
+    arxiv_count = 0
     if arxiv_items:
-        print(f"\nEnriching {len(arxiv_items)} arxiv papers...")
+        log(f"\nEnriching {len(arxiv_items)} arxiv papers...")
         arxiv_count = enrich_arxiv(arxiv_items)
-        print(f"  Enriched {arxiv_count} arxiv papers.")
+        log(f"  Enriched {arxiv_count} arxiv papers.")
     else:
-        print("\nNo new arxiv papers to enrich.")
+        log("\nNo new arxiv papers to enrich.")
 
     # Enrich ACL papers
+    acl_count = 0
     if acl_items:
-        print(f"\nEnriching {len(acl_items)} ACL Anthology papers...")
+        log(f"\nEnriching {len(acl_items)} ACL Anthology papers...")
         acl_count = enrich_acl(acl_items)
-        print(f"  Enriched {acl_count} ACL papers with abstracts.")
+        log(f"  Enriched {acl_count} ACL papers with abstracts.")
     else:
-        print("\nNo new ACL papers to enrich.")
+        log("\nNo new ACL papers to enrich.")
 
     # Other papers
     if other_paper_items:
-        print(f"\nProcessing {len(other_paper_items)} other papers (URL heuristics)...")
+        log(f"\nProcessing {len(other_paper_items)} other papers (URL heuristics)...")
         enrich_other_papers(other_paper_items)
 
     # Non-paper items
     if non_paper_items:
-        print(f"\nSetting null fields for {len(non_paper_items)} non-paper items...")
+        log(f"\nSetting null fields for {len(non_paper_items)} non-paper items...")
         set_null_fields(non_paper_items)
 
     # Write enriched JSON
-    print(f"\nWriting enriched JSON to {JSON_PATH}...")
+    log(f"\nWriting enriched JSON to {JSON_PATH}...")
     with open(JSON_PATH, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     # Generate HTML
-    print(f"Generating HTML to {HTML_PATH}...")
+    log(f"Generating HTML to {HTML_PATH}...")
     html = generate_html(data)
     with open(HTML_PATH, "w") as f:
         f.write(html)
@@ -1179,10 +1462,137 @@ def main():
         for item in cat["items"]
         if item.get("summary") is not None
     )
-    print(f"\nDone!")
-    print(f"  Total papers processed: {total_papers}")
-    print(f"  Items with summary: {enriched_summary}")
-    print(f"  Total items: {data['metadata']['total_items']}")
+
+    summary = {
+        "papers_processed": total_papers,
+        "arxiv_enriched": arxiv_count,
+        "acl_enriched": acl_count,
+        "items_with_summary": enriched_summary,
+        "total_items": data["metadata"]["total_items"],
+    }
+
+    log(f"\nDone!")
+    log(f"  Total papers processed: {total_papers}")
+    log(f"  Items with summary: {enriched_summary}")
+    log(f"  Total items: {data['metadata']['total_items']}")
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# HTTP Server for live editing
+# ---------------------------------------------------------------------------
+
+SERVER_PORT = 8765
+
+class KnowledgeBaseHandler(http.server.SimpleHTTPRequestHandler):
+    """HTTP handler with API endpoints for the knowledge base."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(BASE_DIR), **kwargs)
+
+    def do_GET(self):
+        # Serve index as the knowledge base HTML
+        if self.path == "/" or self.path == "":
+            self.path = "/joel_stremmel_knowledge_base.html"
+        # Ignore favicon requests
+        if self.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        return super().do_GET()
+
+    def do_POST(self):
+        if self.path == "/api/save":
+            self._handle_save()
+        elif self.path == "/api/enrich":
+            self._handle_enrich()
+        else:
+            self.send_error(404, "Not Found")
+
+    def _handle_save(self):
+        """Save the JSON data from the client."""
+        try:
+            content_length = int(self.headers["Content-Length"])
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+
+            with open(JSON_PATH, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            self._send_json({"success": True, "message": "JSON saved"})
+        except Exception as e:
+            self._send_json({"success": False, "error": str(e)}, status=500)
+
+    def _handle_enrich(self):
+        """Run the enrichment pipeline and regenerate HTML."""
+        try:
+            summary = run_enrichment(verbose=False)
+            self._send_json({"success": True, **summary})
+        except Exception as e:
+            self._send_json({"success": False, "error": str(e)}, status=500)
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Quieter logging - only show API calls
+        try:
+            msg = str(args[0]) if args else ""
+            if "/api/" in msg:
+                print(f"[API] {msg}")
+        except:
+            pass
+
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def run_server(port=SERVER_PORT, open_browser=True):
+    """Run the local development server."""
+    with ReusableTCPServer(("", port), KnowledgeBaseHandler) as httpd:
+        url = f"http://localhost:{port}"
+        print(f"\n{'='*60}")
+        print(f"  Knowledge Base Server running at: {url}")
+        print(f"  Press Ctrl+C to stop")
+        print(f"{'='*60}\n")
+
+        if open_browser:
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Knowledge Base Enrichment Tool")
+    parser.add_argument("--serve", "-s", action="store_true",
+                        help="Start local server for live editing")
+    parser.add_argument("--port", "-p", type=int, default=SERVER_PORT,
+                        help=f"Server port (default: {SERVER_PORT})")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Don't open browser automatically")
+    args = parser.parse_args()
+
+    if args.serve:
+        run_server(port=args.port, open_browser=not args.no_browser)
+    else:
+        run_enrichment()
 
 
 if __name__ == "__main__":
