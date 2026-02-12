@@ -6,7 +6,7 @@
       "joel_stremmel_bookmarks.html",
       "bookmarks_2_11_26.html"
     ],
-    "total_items": 372,
+    "total_items": 373,
     "total_categories": 22
   },
   "categories": [
@@ -3165,6 +3165,15 @@
           "url": "https://alchemy.cs.washington.edu/",
           "type": "other",
           "source": "chrome",
+          "summary": null,
+          "date": null,
+          "authors": null
+        },
+        {
+          "title": "spaCy TextCategorizer",
+          "url": "https://spacy.io/api/textcategorizer",
+          "type": "other",
+          "source": "user",
           "summary": null,
           "date": null,
           "authors": null
